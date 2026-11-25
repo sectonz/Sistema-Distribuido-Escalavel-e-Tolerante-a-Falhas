@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Remove logs e arquivos de estado (dados/) na maquina local e em todos os hosts configurados no .env.
-# Uso:
-#   ./limpar_cluster.sh          # limpa apenas logs e dados
-#   ./limpar_cluster.sh --kill   # tambem encerra processos bin/servidor em todos os hosts
+
+#   ./limpar_cluster.sh          # limpa logs e dados
+#   ./limpar_cluster.sh --kill   # tambem encerra processo bin/servidor em todos os hosts
 
 set -u
 
