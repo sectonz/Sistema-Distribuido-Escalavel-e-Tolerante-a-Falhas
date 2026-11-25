@@ -12,8 +12,7 @@ import (
 )
 
 // MSG_<MSG_ID>_<SENDER_ID>_<DEST_ID>_<CONTEUDO>
-// O conteudo e sempre o ultimo campo, entao pode conter "_".
-// Quebras de linha sao trocadas por espaco, pois cada mensagem ocupa uma linha.
+// O conteudo e sempre o ultimo campo, entao pode conter _
 type Msg struct {
 	ID        string
 	Remetente int
@@ -69,31 +68,37 @@ func NovoEstado(coord int) Estado {
 }
 
 func (e Estado) Clonar() Estado {
-	b, _ := json.Marshal(e)
-	var copia Estado
-	_ = json.Unmarshal(b, &copia)
-	if copia.Usuarios == nil {
-		copia.Usuarios = map[int]string{}
+	copia := Estado{
+		Versao:      e.Versao,
+		Coordenador: e.Coordenador,
+		TsEnvio:     e.TsEnvio,
+		Usuarios:    make(map[int]string, len(e.Usuarios)),
+		Alocacao:    make(map[int]int, len(e.Alocacao)),
+		Processadas: make(map[string]bool, len(e.Processadas)),
+		Servidores:  make(map[int]string, len(e.Servidores)),
 	}
-	if copia.Alocacao == nil {
-		copia.Alocacao = map[int]int{}
+	for k, v := range e.Usuarios {
+		copia.Usuarios[k] = v
 	}
-	if copia.Processadas == nil {
-		copia.Processadas = map[string]bool{}
+	for k, v := range e.Alocacao {
+		copia.Alocacao[k] = v
 	}
-	if copia.Servidores == nil {
-		copia.Servidores = map[int]string{}
+	for k, v := range e.Processadas {
+		copia.Processadas[k] = v
+	}
+	for k, v := range e.Servidores {
+		copia.Servidores[k] = v
 	}
 	return copia
 }
 
 func SalvarEstado(caminho string, e Estado) error {
 	os.MkdirAll(filepath.Dir(caminho), 0755)
-	b, err := json.MarshalIndent(e, "", "  ")
+	b, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	tmp := caminho + ".tmp"
+	tmp := fmt.Sprintf("%s.%d.tmp", caminho, time.Now().UnixNano())
 	if err := os.WriteFile(tmp, b, 0644); err != nil {
 		return err
 	}

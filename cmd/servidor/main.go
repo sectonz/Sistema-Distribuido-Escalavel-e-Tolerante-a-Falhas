@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,23 +33,43 @@ func receive_msg(m *string) bool {
 }
 
 type Servidor struct {
-	id      int
-	maxID   int
-	cfg     comum.Config
-	log     *comum.Logger
-	arqEst  string
-	parar   chan struct{}
+	id     int
+	maxID  int
+	cfg    comum.Config
+	log    *comum.Logger
+	arqEst string
+	parar  chan struct{}
 
-	mu          sync.Mutex
-	coord       int
-	pronto      bool
-	emEleicao   bool
-	estado      comum.Estado
-	vivos       map[int]time.Time
-	tsKill      map[int]time.Time
+	mu           sync.Mutex
+	muDisco      sync.Mutex
+	coordAtom    atomic.Int32
+	prontoAtom   atomic.Bool
+	coord        int
+	pronto       bool
+	emEleicao    bool
+	estado       comum.Estado
+	vivos        map[int]time.Time
+	tsKill       map[int]time.Time
 	emCurso      map[string]chan struct{}
 	contExecMsg  map[string]int
 	hostsProntos map[string]bool
+}
+
+func (s *Servidor) definirCoord(cid int) {
+	s.coord = cid
+	s.coordAtom.Store(int32(cid))
+}
+
+func (s *Servidor) definirPronto(p bool) {
+	s.pronto = p
+	s.prontoAtom.Store(p)
+}
+
+// Salva o estado em disco fora de s.mu para nunca bloquear heartbeats ou eleicoes.
+func (s *Servidor) salvarEmDisco(snap comum.Estado) {
+	s.muDisco.Lock()
+	defer s.muDisco.Unlock()
+	_ = comum.SalvarEstado(s.arqEst, snap)
 }
 
 func main() {
@@ -95,30 +116,29 @@ func main() {
 			s.sincronizarNoRetorno()
 		} else {
 			s.mu.Lock()
-			s.coord = 0
-			s.pronto = true
+			s.definirCoord(0)
+			s.definirPronto(true)
 			s.estado.Coordenador = 0
 			s.estado.Servidores[0] = end
-			_ = comum.SalvarEstado(s.arqEst, s.estado)
+			snap := s.estado.Clonar()
 			s.mu.Unlock()
+			s.salvarEmDisco(snap)
 			s.log.Registrar("coordenador", s.id, "inicio_coordenador", 1, "endereco", end)
 			s.garantirServidoresParaUsuarios()
 		}
 	} else {
 		s.mu.Lock()
-		s.pronto = true
+		s.definirPronto(true)
 		s.mu.Unlock()
 		s.log.Registrar("servidor", s.id, "inicio_servidor", 1, "endereco", end)
 	}
 
 	go comum.OuvirHeartbeats(cfg.Multicast, s.parar, s.receberHeartbeat)
 	go comum.EnviarHeartbeats(cfg.Multicast, cfg.Heartbeat, s.parar, func() string {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		if !s.pronto {
+		if !s.prontoAtom.Load() {
 			return ""
 		}
-		return comum.MensagemHeartbeat(s.id, s.coord)
+		return comum.MensagemHeartbeat(s.id, int(s.coordAtom.Load()))
 	})
 	go s.monitorarFalhas()
 
@@ -189,13 +209,14 @@ func (s *Servidor) sincronizarNoRetorno() {
 			if json.Unmarshal([]byte(strings.TrimPrefix(resp, "SYNC_OK_")), &est) == nil {
 				s.mu.Lock()
 				s.estado = est.Clonar()
-				s.coord = est.Coordenador
-				s.pronto = true
+				s.definirCoord(est.Coordenador)
+				s.definirPronto(true)
 				for id := range est.Servidores {
 					s.vivos[id] = time.Now()
 				}
-				_ = comum.SalvarEstado(s.arqEst, s.estado)
+				snap := s.estado.Clonar()
 				s.mu.Unlock()
+				s.salvarEmDisco(snap)
 				s.log.Registrar("servidor", s.id, "tempo_sincronizacao_retorno", comum.Seg(time.Since(inicio)), "coordenador", cid)
 				return
 			}
@@ -208,12 +229,13 @@ func (s *Servidor) sincronizarNoRetorno() {
 	if err == nil {
 		s.estado = est
 	}
-	s.coord = s.id
-	s.pronto = true
+	s.definirCoord(s.id)
+	s.definirPronto(true)
 	s.estado.Coordenador = s.id
 	s.estado.Servidores = map[int]string{s.id: s.cfg.EnderecoServidor(s.id)}
-	_ = comum.SalvarEstado(s.arqEst, s.estado)
+	snap := s.estado.Clonar()
 	s.mu.Unlock()
+	s.salvarEmDisco(snap)
 	s.log.Registrar("servidor", s.id, "tempo_sincronizacao_retorno", comum.Seg(time.Since(inicio)), "coordenador", s.id)
 	s.notificarNovoCoordenadorCadastro()
 	s.garantirServidoresParaUsuarios()
@@ -236,25 +258,32 @@ func (s *Servidor) receberHeartbeat(id, coord int) {
 	conflitoCoord := false
 	if id != s.id && coord == id && s.coord == s.id {
 		if id > s.id {
-			s.coord = id
+			s.definirCoord(id)
 			s.estado.Coordenador = id
 		} else {
 			conflitoCoord = true
 		}
 	} else if _, coordVivo := s.vivos[s.coord]; !coordVivo && coord >= 0 {
-		s.coord = coord
+		s.definirCoord(coord)
 		s.estado.Coordenador = coord
 	}
 	souCoord := s.coord == s.id
+	var snap comum.Estado
+	salvar := false
 	if !jaVivo && id != s.id && souCoord {
 		if id > s.maxID {
 			s.maxID = id
 		}
 		s.estado.Versao++
 		s.estado.TsEnvio = comum.Agora()
-		_ = comum.SalvarEstado(s.arqEst, s.estado)
+		snap = s.estado.Clonar()
+		salvar = true
 	}
 	s.mu.Unlock()
+
+	if salvar {
+		go s.salvarEmDisco(snap)
+	}
 
 	if conflitoCoord {
 		go s.iniciarEleicao(0)
@@ -332,7 +361,7 @@ func (s *Servidor) verificarTimeouts() {
 	}
 }
 
-// Algoritmo de eleicao Bully: desafia servidores ativos com ID maior.
+// Bully
 func (s *Servidor) iniciarEleicao(tempoDeteccao time.Duration) {
 	s.mu.Lock()
 	if s.emEleicao || !s.pronto {
@@ -378,7 +407,7 @@ func (s *Servidor) iniciarEleicao(tempoDeteccao time.Duration) {
 func (s *Servidor) assumirCoordenacao(tempoDeteccao time.Duration) {
 	s.mu.Lock()
 	antigoCoord := s.coord
-	s.coord = s.id
+	s.definirCoord(s.id)
 	s.estado.Coordenador = s.id
 	s.estado.Versao++
 	delete(s.vivos, antigoCoord)
@@ -391,8 +420,9 @@ func (s *Servidor) assumirCoordenacao(tempoDeteccao time.Duration) {
 			pares = append(pares, id)
 		}
 	}
-	_ = comum.SalvarEstado(s.arqEst, s.estado)
+	snap := s.estado.Clonar()
 	s.mu.Unlock()
+	s.salvarEmDisco(snap)
 
 	if tempoDeteccao > 0 {
 		s.log.Registrar("coordenador", s.id, "tempo_deteccao_falha", comum.Seg(tempoDeteccao), "servidor_falho", antigoCoord)
@@ -440,8 +470,9 @@ func (s *Servidor) redistribuirUsuariosDeFalho(idFalho int) {
 
 	s.mu.Lock()
 	s.estado.Versao++
-	_ = comum.SalvarEstado(s.arqEst, s.estado)
+	snap := s.estado.Clonar()
 	s.mu.Unlock()
+	s.salvarEmDisco(snap)
 
 	s.replicarEstado()
 	s.log.Registrar("coordenador", s.id, "tempo_redistribuicao_usuarios", comum.Seg(time.Since(inicio)), "servidor_falho", idFalho, "migrados", migrados)
@@ -549,8 +580,9 @@ func (s *Servidor) garantirServidoresParaUsuarios() {
 
 	s.mu.Lock()
 	s.estado.Versao++
-	_ = comum.SalvarEstado(s.arqEst, s.estado)
+	snap := s.estado.Clonar()
 	s.mu.Unlock()
+	s.salvarEmDisco(snap)
 
 	s.replicarEstado()
 	s.log.Registrar("coordenador", s.id, "usuarios_migrados", float64(migrados), "evento", "recuperacao_geral")
@@ -564,7 +596,6 @@ func (s *Servidor) criarNovoServidor() int {
 	hostAlvo := s.cfg.HostServidor(novoID)
 	end := s.cfg.EnderecoServidor(novoID)
 	s.estado.Servidores[novoID] = end
-	s.vivos[novoID] = time.Now()
 	s.mu.Unlock()
 
 	exe, err := os.Executable()
@@ -579,7 +610,7 @@ func (s *Servidor) criarNovoServidor() int {
 		}
 	}
 
-	prazo := time.Now().Add(5 * time.Second)
+	prazo := time.Now().Add(8 * time.Second)
 	for time.Now().Before(prazo) {
 		if resp, err := comum.Requisitar(end, "PING", 200*time.Millisecond); err == nil && strings.HasPrefix(resp, "PONG_") {
 			_, _ = comum.Requisitar(end, fmt.Sprintf("COORDINATOR_%d", s.id), 300*time.Millisecond)
@@ -588,12 +619,17 @@ func (s *Servidor) criarNovoServidor() int {
 		time.Sleep(80 * time.Millisecond)
 	}
 
+	// Registra em s.vivos somente apos o servidor estar operante para evitar falso timeout durante o scp/ssh.
+	s.mu.Lock()
+	s.vivos[novoID] = time.Now()
+	s.mu.Unlock()
+
 	s.log.Registrar("coordenador", s.id, "tempo_novo_servidor_operante", comum.Seg(time.Since(inicio)), "novo_servidor", novoID, "host", hostAlvo)
 	_, _ = comum.Requisitar(s.cfg.EnderecoCadastro(), fmt.Sprintf("NEWID_%d", novoID), s.cfg.Timeout)
 	return novoID
 }
 
-// Prepara a maquina remota (copia binario e .env se necessario) e inicia o servidor via SSH.
+// Prepara a maquina remota (copia binario e .env apenas se ainda nao existirem) e inicia o servidor via SSH.
 func (s *Servidor) iniciarServidorRemotoSSH(host, exe string, novoID int) {
 	workDir := s.cfg.WorkDir
 	if workDir == "" {
@@ -613,9 +649,15 @@ func (s *Servidor) iniciarServidorRemotoSSH(host, exe string, novoID int) {
 			log.Printf("[coordenador %d] aviso: falha ao criar diretorios em %s via ssh: %v", s.id, host, err)
 		}
 
-		scpBin := exec.Command("scp", append(sshOpts, exe, fmt.Sprintf("%s:%s", host, binRemoto))...)
+		// Evita falha de "Text file busy" caso um binario antigo ja esteja em execucao na maquina remota:
+		// copia para um arquivo temporario e substitui atomicamente com mv.
+		binTmp := fmt.Sprintf("%s.%d.tmp", binRemoto, time.Now().UnixNano())
+		scpBin := exec.Command("scp", append(sshOpts, exe, fmt.Sprintf("%s:%s", host, binTmp))...)
 		if err := scpBin.Run(); err != nil {
 			log.Printf("[coordenador %d] aviso: falha ao copiar binario para %s via scp: %v", s.id, host, err)
+		} else {
+			mvCmd := exec.Command("ssh", append(sshOpts, host, fmt.Sprintf("mv -f %q %q && chmod +x %q", binTmp, binRemoto, binRemoto))...)
+			_ = mvCmd.Run()
 		}
 
 		arqEnv := filepath.Join(workDir, ".env")
@@ -678,8 +720,9 @@ func (s *Servidor) verificarServidoresOciosos() {
 		delete(s.estado.Servidores, idOcioso)
 		delete(s.vivos, idOcioso)
 		s.estado.Versao++
-		_ = comum.SalvarEstado(s.arqEst, s.estado)
+		snap := s.estado.Clonar()
 		s.mu.Unlock()
+		s.salvarEmDisco(snap)
 
 		inicio := time.Now()
 		_, _ = comum.Requisitar(s.cfg.EnderecoServidor(idOcioso), "SHUTDOWN", s.cfg.Timeout)
@@ -814,7 +857,7 @@ func (s *Servidor) tratarComando(linha string) string {
 			return "ERROR_INVALID_COMMAND"
 		}
 		s.mu.Lock()
-		s.coord = novoCoord
+		s.definirCoord(novoCoord)
 		s.estado.Coordenador = novoCoord
 		s.vivos[novoCoord] = time.Now()
 		s.estado.Servidores[novoCoord] = s.cfg.EnderecoServidor(novoCoord)
@@ -835,13 +878,20 @@ func (s *Servidor) tratarComando(linha string) string {
 				snap.Processadas[idMsg] = true
 			}
 		}
+		var paraSalvar comum.Estado
+		deveSalvar := false
 		if snap.Versao >= s.estado.Versao {
 			s.estado = snap.Clonar()
-			s.coord = snap.Coordenador
-			s.pronto = true
-			_ = comum.SalvarEstado(s.arqEst, s.estado)
+			s.definirCoord(snap.Coordenador)
+			s.definirPronto(true)
+			paraSalvar = s.estado.Clonar()
+			deveSalvar = true
 		}
 		s.mu.Unlock()
+
+		if deveSalvar {
+			s.salvarEmDisco(paraSalvar)
+		}
 
 		atraso := comum.Agora() - snap.TsEnvio
 		if atraso < 0 {
@@ -857,8 +907,9 @@ func (s *Servidor) tratarComando(linha string) string {
 		s.mu.Lock()
 		s.estado.Processadas[msgID] = true
 		s.estado.Versao++
-		_ = comum.SalvarEstado(s.arqEst, s.estado)
+		snap := s.estado.Clonar()
 		s.mu.Unlock()
+		s.salvarEmDisco(snap)
 		go s.replicarEstado()
 		return "ACK_PROCESSED"
 
@@ -899,9 +950,10 @@ func (s *Servidor) tratarComando(linha string) string {
 		s.estado.Servidores[idRet] = s.cfg.EnderecoServidor(idRet)
 		s.estado.Versao++
 		s.estado.TsEnvio = comum.Agora()
-		_ = comum.SalvarEstado(s.arqEst, s.estado)
-		b, _ := json.Marshal(s.estado)
+		snap := s.estado.Clonar()
+		b, _ := json.Marshal(snap)
 		s.mu.Unlock()
+		s.salvarEmDisco(snap)
 
 		go func() {
 			_, _ = comum.Requisitar(s.cfg.EnderecoCadastro(), fmt.Sprintf("NEWID_%d", idRet), s.cfg.Timeout)
@@ -912,31 +964,45 @@ func (s *Servidor) tratarComando(linha string) string {
 		return "SYNC_OK_" + string(b)
 
 	case strings.HasPrefix(linha, "NEWUSER_"):
-		if s.coord != s.id {
-			return s.redirecionar()
+		if int(s.coordAtom.Load()) != s.id {
+			return s.encaminharAoCoordenador(linha)
 		}
 		return s.tratarNewUser(linha)
 
 	case strings.HasPrefix(linha, "DELUSER_"):
-		if s.coord != s.id {
-			return s.redirecionar()
+		if int(s.coordAtom.Load()) != s.id {
+			return s.encaminharAoCoordenador(linha)
 		}
 		return s.tratarDelUser(linha)
 
 	case strings.HasPrefix(linha, "KILL_"):
-		if s.coord != s.id {
-			return s.redirecionar()
+		if int(s.coordAtom.Load()) != s.id {
+			return s.encaminharAoCoordenador(linha)
 		}
 		return s.tratarKill(linha)
 
 	case strings.HasPrefix(linha, "MSG_"):
-		if s.coord != s.id {
+		if int(s.coordAtom.Load()) != s.id {
 			return s.redirecionar()
 		}
 		return s.tratarMensagemUsuario(linha)
 	}
 
 	return "ERROR_INVALID_COMMAND"
+}
+
+// Encaminha comandos de controle (NEWUSER, DELUSER, KILL) ao coordenador atual,
+// garantindo que clientes como o cadastro.py nao percam comandos durante mudancas de lider.
+func (s *Servidor) encaminharAoCoordenador(linha string) string {
+	cid := int(s.coordAtom.Load())
+	if cid == s.id {
+		return "ERROR_NOT_COORDINATOR"
+	}
+	resp, err := comum.Requisitar(s.cfg.EnderecoServidor(cid), linha, s.cfg.Timeout+2*time.Second)
+	if err != nil {
+		return "ERROR_COORDINATOR_UNAVAILABLE"
+	}
+	return resp
 }
 
 func (s *Servidor) redirecionar() string {
@@ -971,9 +1037,10 @@ func (s *Servidor) tratarNewUser(linha string) string {
 		s.mu.Lock()
 		s.estado.Usuarios[uid] = nome
 		s.estado.Versao++
-		_ = comum.SalvarEstado(s.arqEst, s.estado)
+		snap := s.estado.Clonar()
 		s.mu.Unlock()
 
+		s.salvarEmDisco(snap)
 		s.replicarEstado()
 		s.log.Registrar("coordenador", s.id, "usuarios_migrados", 0, "evento", "criacao", "usuario", uid, "servidor", srv)
 		s.emitirMetricasDistribuicao()
@@ -990,9 +1057,10 @@ func (s *Servidor) tratarDelUser(linha string) string {
 	delete(s.estado.Usuarios, uid)
 	delete(s.estado.Alocacao, uid)
 	s.estado.Versao++
-	_ = comum.SalvarEstado(s.arqEst, s.estado)
+	snap := s.estado.Clonar()
 	s.mu.Unlock()
 
+	s.salvarEmDisco(snap)
 	s.replicarEstado()
 	s.log.Registrar("coordenador", s.id, "usuarios_migrados", 0, "evento", "remocao", "usuario", uid)
 	s.emitirMetricasDistribuicao()
@@ -1115,9 +1183,10 @@ func (s *Servidor) executarReceiveMsg(msg *comum.Msg) string {
 	if souCoord {
 		s.estado.Versao++
 	}
-	_ = comum.SalvarEstado(s.arqEst, s.estado)
+	snap := s.estado.Clonar()
 	close(ch)
 	s.mu.Unlock()
+	s.salvarEmDisco(snap)
 
 	if souCoord {
 		s.replicarEstado()
