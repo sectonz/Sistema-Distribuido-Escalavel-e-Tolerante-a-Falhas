@@ -4,15 +4,55 @@ Dashboard web simples para monitoramento e centralização de métricas e estado
 Executa na porta 8080 (ou PORT especificada).
 """
 
+import concurrent.futures
+import datetime
 import glob
 import json
 import os
+import socket
+import subprocess
 import sys
+import threading
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-PORT = int(os.environ.get("DASHBOARD_PORT", 8080))
+PORT = int(os.environ.get("DASHBOARD_PORT", 48702))
+
+
+def carregar_env():
+    env = {}
+    for candidato in (BASE_DIR / ".env", BASE_DIR / "cadastro" / ".env"):
+        if candidato.exists():
+            for line in candidato.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    env[k.strip()] = v.strip().strip('"').strip("'")
+            break
+    return env
+
+
+CFG = carregar_env()
+SERVER_IP = os.environ.get("SERVER_IP", CFG.get("SERVER_IP", "127.0.0.1"))
+SERVER_HOSTS = [
+    h.strip()
+    for h in os.environ.get("SERVER_HOSTS", CFG.get("SERVER_HOSTS", "")).split(",")
+    if h.strip()
+] or [SERVER_IP]
+SERVER_PORT = int(os.environ.get("SERVER_PORT", CFG.get("SERVER_PORT", 5001)))
+MAX_USUARIOS = int(os.environ.get("MAX_USUARIOS", CFG.get("MAX_USUARIOS", 5)))
+CADASTRO_HTTP_PORT = int(os.environ.get("HTTP_PORT", CFG.get("HTTP_PORT", 8000)))
+REMOTE_WORKDIR = os.environ.get("REMOTE_WORKDIR", CFG.get("REMOTE_WORKDIR", str(BASE_DIR)))
+
+_coord_lock = threading.Lock()
+_coord_cache = (SERVER_HOSTS[0], SERVER_PORT)
+
+_logs_remotos_lock = threading.Lock()
+_logs_remotos_cache = []
+_logs_remotos_ts = 0.0
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -243,19 +283,182 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </html>
 """
 
-def extrair_resumo():
-    # 1. Encontra o estado mais recente entre os arquivos em dados/
-    estado_atual = {}
-    arquivos_estado = sorted(glob.glob(str(BASE_DIR / "dados" / "estado_servidor_*.json")), key=os.path.getmtime, reverse=True)
-    for p in arquivos_estado:
+def host_servidor(sid):
+    return SERVER_HOSTS[sid % len(SERVER_HOSTS)]
+
+
+def eh_host_local(host):
+    if host in ("", "127.0.0.1", "localhost"):
+        return True
+    hn = socket.gethostname().split(".")[0].lower()
+    return host.split(".")[0].lower() == hn
+
+
+def consultar_tcp(host, porta, comando, timeout=0.6):
+    with socket.create_connection((host, porta), timeout=timeout) as sock:
+        sock.settimeout(timeout)
+        sock.sendall((comando + "\n").encode("utf-8"))
+        partes = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            partes.append(chunk)
+            if b"\n" in chunk:
+                break
+        return b"".join(partes).split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+
+
+def obter_coordenador_do_cadastro():
+    try:
+        url = f"http://127.0.0.1:{CADASTRO_HTTP_PORT}/api/status"
+        with urllib.request.urlopen(url, timeout=0.35) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            coord_str = data.get("coordinator", "")
+            if ":" in coord_str:
+                h, p = coord_str.rsplit(":", 1)
+                return h, int(p)
+    except Exception:
+        pass
+    return None
+
+
+def descobrir_coordenador_rede(max_id=30):
+    def sondar(sid):
+        h = host_servidor(sid)
+        p = SERVER_PORT + sid
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                if d.get("servidores"):
-                    estado_atual = d
-                    break
+            resp = consultar_tcp(h, p, "WHOISCOORD", timeout=0.35)
+            if resp.startswith("COORD_"):
+                partes = resp.split("_")
+                if len(partes) == 4:
+                    return partes[2], int(partes[3])
+        except Exception:
+            pass
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futuros = [ex.submit(sondar, sid) for sid in range(max_id + 1)]
+        for fut in concurrent.futures.as_completed(futuros):
+            res = fut.result()
+            if res is not None:
+                return res
+    return None
+
+
+def obter_estado_ao_vivo():
+    global _coord_cache
+    candidatos = []
+    with _coord_lock:
+        if _coord_cache:
+            candidatos.append(_coord_cache)
+
+    do_cadastro = obter_coordenador_do_cadastro()
+    if do_cadastro and do_cadastro not in candidatos:
+        candidatos.append(do_cadastro)
+
+    for host, porta in candidatos:
+        try:
+            resp = consultar_tcp(host, porta, "STATUS", timeout=0.8)
+            if resp.startswith("{"):
+                est = json.loads(resp)
+                cid = est.get("coordenador")
+                if cid is not None:
+                    h_coord = host_servidor(int(cid))
+                    p_coord = SERVER_PORT + int(cid)
+                    if (h_coord, p_coord) != (host, porta):
+                        try:
+                            resp2 = consultar_tcp(h_coord, p_coord, "STATUS", timeout=0.8)
+                            if resp2.startswith("{"):
+                                est = json.loads(resp2)
+                                host, porta = h_coord, p_coord
+                        except Exception:
+                            pass
+                with _coord_lock:
+                    _coord_cache = (host, porta)
+                return est
         except Exception:
             continue
+
+    descoberto = descobrir_coordenador_rede(30)
+    if descoberto:
+        host, porta = descoberto
+        try:
+            resp = consultar_tcp(host, porta, "STATUS", timeout=0.8)
+            if resp.startswith("{"):
+                with _coord_lock:
+                    _coord_cache = (host, porta)
+                return json.loads(resp)
+        except Exception:
+            pass
+
+    return None
+
+
+def coletar_logs_remotos():
+    global _logs_remotos_cache, _logs_remotos_ts
+    remotos = [h for h in dict.fromkeys(SERVER_HOSTS) if not eh_host_local(h)]
+    if not remotos:
+        return []
+
+    agora = time.time()
+    with _logs_remotos_lock:
+        if agora - _logs_remotos_ts < 4.0:
+            return list(_logs_remotos_cache)
+
+    def buscar_host(host):
+        itens = []
+        cmd = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=2",
+            host,
+            f"tail -q -n 40 {REMOTE_WORKDIR}/logs/servidor_*.json 2>/dev/null || true",
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=3)
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        itens.append(json.loads(line))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return itens
+
+    coletados = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(remotos)) as ex:
+        for res in ex.map(buscar_host, remotos):
+            coletados.extend(res)
+
+    with _logs_remotos_lock:
+        _logs_remotos_cache = coletados
+        _logs_remotos_ts = time.time()
+    return coletados
+
+
+def extrair_resumo():
+    # 1. Consulta o estado ao vivo via TCP no coordenador atual (funciona em multi-maquinas).
+    #    Caso nenhum servidor responda na rede, usa o snapshot local em dados/ como fallback.
+    estado_atual = obter_estado_ao_vivo() or {}
+    if not estado_atual:
+        arquivos_estado = sorted(
+            glob.glob(str(BASE_DIR / "dados" / "estado_servidor_*.json")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for p in arquivos_estado:
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                    if d.get("servidores"):
+                        estado_atual = d
+                        break
+            except Exception:
+                continue
 
     srvs = estado_atual.get("servidores", {})
     aloc = estado_atual.get("alocacao", {})
@@ -282,10 +485,10 @@ def extrair_resumo():
     com_u = sum(1 for s in lista_servidores if s["usuarios"] > 0)
     ociosos = total_srvs - com_u
     media_u = round(total_u / total_srvs, 2) if total_srvs > 0 else 0
-    max_u = 5
+    max_u = MAX_USUARIOS
     necessarios = -(-total_u // max_u) if total_u > 0 else 1
 
-    # 2. Coleta eventos críticos e métricas recentes dos logs
+    # 2. Coleta eventos críticos e métricas recentes dos logs locais e das máquinas remotas
     eventos = []
     metricas = {}
     eventos_chave = {
@@ -306,9 +509,9 @@ def extrair_resumo():
         except Exception:
             continue
 
+    linhas_recentes.extend(coletar_logs_remotos())
     linhas_recentes.sort(key=lambda x: x.get("ts", 0), reverse=True)
 
-    import datetime
     for item in linhas_recentes[:300]:
         m = item.get("metrica")
         ts = item.get("ts", 0)
