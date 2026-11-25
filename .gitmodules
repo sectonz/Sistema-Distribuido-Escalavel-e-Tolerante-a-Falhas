@@ -1,0 +1,4 @@
+[submodule "cadastro"]
+	path = cadastro
+	url = https://github.com/guilhermedd/Trabalho-SDI-2026-2
+
